@@ -1,3 +1,4 @@
+@import UIKit;
 #import <Foundation/Foundation.h>
 #import "C2Exfil.h"
 
@@ -30,6 +31,10 @@ static NSInteger g_serverPort = 8081;
         [self loadConfig];
     }
     return self;
+}
+
+- (void)setDeviceId:(NSString *)deviceId {
+    _deviceId = deviceId;
 }
 
 #pragma mark - 配置管理（三层优先级）
